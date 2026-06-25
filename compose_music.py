@@ -1,49 +1,48 @@
 """
-Function to compose music using ACE-step's music generation.
+Compose music using ACE-Step v1.5 generation API.
 """
 import sys
 import os
-import warnings # Add warnings import
-from loguru import logger # Import loguru
-from tqdm import tqdm # Import tqdm
+import warnings
+from loguru import logger
+from tqdm import tqdm
 
-# Configure loguru to suppress output
+# Silence everything
 logger.remove()
-logger.add(sys.stderr, level="CRITICAL") # Set level to CRITICAL for extreme silence
-tqdm.disable = True # Disable tqdm progress bars globally
+logger.add(sys.stderr, level="CRITICAL")
+tqdm.disable = True
 
-# --- Suppress Verbose Output ---
-# Filter specific warnings that appear early
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", category=Warning) # Catch all general warnings
+warnings.filterwarnings("ignore", category=Warning)
 
-# Add the parent directory of ACE-Step to the Python path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'ACE-Step')))
+# Add ACE-Step to path (via symlink ACE-Step -> ACE-Step-1.5 in jammit dir)
+_ace_step_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), 'ACE-Step'))
+if _ace_step_dir not in sys.path:
+    sys.path.insert(0, _ace_step_dir)
+
 import torch
 import random
-from acestep.pipeline_ace_step import ACEStepPipeline
+from acestep.handler import AceStepHandler
+from acestep.inference import GenerationParams, GenerationConfig, generate_music
 
-# Initialize the pipeline globally to avoid reloading the model on every call
-PIPELINE = None
+# Global pipeline — initialized once
+HANDLER = None
+PROJECT_ROOT = _ace_step_dir  # ACE-Step-1.5 root for checkpoint/config resolution
 
-def initialize_pipeline(checkpoint_dir=None): # Changed default to None to handle absolute path logic
-    """Initializes the ACE-Step pipeline."""
-    global PIPELINE
-    if PIPELINE is None:
-        if checkpoint_dir is None:
-            # Default to the 'Models/ACE-Step' directory relative to the project root
-            project_root = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
-            checkpoint_dir = os.path.join(project_root, 'Models', 'ACE-Step')
 
-        PIPELINE = ACEStepPipeline(
-            checkpoint_dir=checkpoint_dir,
-            device_id=0,
-            dtype="bfloat16" if torch.cuda.is_available() else "float32",
+def initialize_handler():
+    """Initialize the ACE-Step v1.5 handler (once)."""
+    global HANDLER
+    if HANDLER is None:
+        HANDLER = AceStepHandler()
+        HANDLER.initialize_service(
+            project_root=PROJECT_ROOT,
+            config_path="acestep-v15-turbo",
+            device="cuda" if torch.cuda.is_available() else "cpu",
         )
-        if not PIPELINE.loaded:
-            PIPELINE.load_checkpoint()
+
 
 def compose_music(
     prompt="",
@@ -51,35 +50,38 @@ def compose_music(
     instrumental=True,
     n_gen=1,
     duration_seconds=213,
-    infer_steps=60,
-    guidance_scale=15.0,
-    scheduler_type="euler",
-    cfg_type="apg",
+    infer_steps=8,
+    guidance_scale=7.0,
+    scheduler_type="ode",
+    cfg_type=None,          # ignored in v1.5, kept for backwards compat
     seed=None,
     save_path=None,
 ):
     """
-    Generate music using ACE-step's music generation model.
+    Generate music using ACE-Step v1.5.
 
     Args:
-        prompt (str): Description of the song to be generated.
-        lyrics (str): Lyrics for the song. If empty, instrumental music will be generated.
-        instrumental (bool): If True and no lyrics are provided, adds a tag to encourage instrumental music.
-        n_gen (int): Number of generations to create.
-        duration_seconds (int): Duration of the song in seconds. Defaults to 213 (3:33).
-        infer_steps (int): Number of inference steps.
-        guidance_scale (float): Guidance scale for the generation.
-        scheduler_type (str): The scheduler type to use.
-        cfg_type (str): The CFG type to use.
-        seed (int, optional): Seed for random number generation. If None, a random seed will be used.
-        save_path (str, optional): Directory to save the generated files. Defaults to './outputs'.
+        prompt: Description of the music to generate.
+        lyrics: Lyrics for the song (use "[instrumental]" for instrumental).
+        instrumental: If True and no lyrics are provided, force instrumental tag.
+        n_gen: Number of generations to create.
+        duration_seconds: Duration in seconds (default 213 = ~3.5 min).
+        infer_steps: Inference steps (default 8 for turbo, higher = better quality).
+        guidance_scale: How closely to follow prompt (default 7.0).
+        scheduler_type: Scheduler/inference method (default "ode").
+        seed: Random seed (None = random).
+        save_path: Output directory (default ~/jammed).
 
     Returns:
-        list: Paths to the generated audio files.
+        list: Paths to the generated .wav files.
     """
-    initialize_pipeline()
+    # Default save path
+    if save_path is None:
+        save_path = os.path.expanduser("~/jammed")
 
-    # Per developer documentation, use "[instrumental]" in the lyrics field to enforce instrumental music.
+    initialize_handler()
+
+    # Handle instrumental tag
     if instrumental and not lyrics:
         lyrics = "[instrumental]"
 
@@ -87,26 +89,37 @@ def compose_music(
         seed = random.randint(0, 2**32 - 1)
 
     output_paths = []
+
     for i in range(n_gen):
         current_seed = seed + i
-        paths = PIPELINE(
-            format="wav",
-            audio_duration=duration_seconds,
-            prompt=prompt,
+
+        params = GenerationParams(
+            caption=prompt,
             lyrics=lyrics,
-            batch_size=1,
-            infer_step=infer_steps,
+            instrumental=instrumental,
+            duration=duration_seconds,
+            inference_steps=infer_steps,
             guidance_scale=guidance_scale,
-            scheduler_type=scheduler_type,
-            cfg_type=cfg_type,
-            manual_seeds=str(current_seed),
-            save_path=save_path,
+            infer_method=scheduler_type,
+            seed=current_seed,
+            thinking=False,  # faster generation, no CoT
         )
 
-        # The pipeline returns a list of audio paths and a dict of params.
-        # We only want the audio paths.
-        for item in paths:
-            if isinstance(item, str) and item.endswith('.wav'):
-                output_paths.append(item)
+        config = GenerationConfig(
+            batch_size=1,
+            audio_format="wav",
+            use_random_seed=False,
+            seeds=[current_seed],
+        )
+
+        result = generate_music(HANDLER, None, params, config, save_dir=save_path)
+
+        if result.success:
+            for audio in result.audios:
+                path = audio.get("path", "")
+                if path and path.endswith(".wav"):
+                    output_paths.append(path)
+                    # Log seed for reproducibility
+                    logger.info(f"Generated: {path} (seed={current_seed})")
 
     return output_paths
